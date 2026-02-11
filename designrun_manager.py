@@ -67,6 +67,11 @@ def get_aura_operator_script() -> Path:
     return get_project_root() / "aura_operator.py"
 
 
+def get_variant_operator_script() -> Path:
+    """Path to variant_operator.py (same directory as this script)."""
+    return get_project_root() / "variant_operator.py"
+
+
 def read_config() -> Dict[str, Any]:
     """Read config.json from project root. Missing or invalid file returns {}."""
     path = get_project_root() / "config.json"
@@ -134,6 +139,8 @@ def ensure_step_layout(step_dir: Path) -> None:
     (step_dir / "generators" / "aura" / "exports").mkdir(parents=True, exist_ok=True)
     (step_dir / "generators" / "aura" / "captures").mkdir(parents=True, exist_ok=True)
     (step_dir / "generators" / "variant").mkdir(parents=True, exist_ok=True)
+    (step_dir / "generators" / "variant" / "exports").mkdir(parents=True, exist_ok=True)
+    (step_dir / "generators" / "variant" / "captures").mkdir(parents=True, exist_ok=True)
 
 
 def list_step_ids(run_id: str) -> List[str]:
@@ -549,6 +556,203 @@ def run_aura(
 
 
 # ----------------------------
+# Variant: invoke + update designrun
+# ----------------------------
+
+
+def run_variant(
+    run_id: str,
+    step_id: str,
+    *,
+    url: Optional[str] = None,
+    timeout_s: int = 300,
+    headed: bool = False,
+    profile_dir: Optional[str] = None,
+    connect: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run variant_operator for the given step. Only supports VARIATIONS mode (from input/mode.txt).
+    Update designrun.json variant_project_url when the operator returns it (e.g. first run).
+    """
+    run_dir = get_run_dir(run_id)
+    step_dir = get_step_dir(run_id, step_id)
+    designrun = read_designrun(run_dir)
+
+    mode_path = step_dir / "input" / "mode.txt"
+    if not mode_path.exists():
+        raise ValueError(f"Step mode not set: {mode_path}. Set input first (set-input).")
+    mode = mode_path.read_text(encoding="utf-8").strip().upper()
+    if mode != "VARIATIONS":
+        raise ValueError(
+            f"Variant operator supports only VARIATIONS mode; step mode is {mode!r}. "
+            "Use run-aura for DNA/FEEDBACK."
+        )
+
+    prompt_file = step_dir / "gpt" / "outputs" / "variant_prompt.txt"
+    if not prompt_file.exists():
+        raise FileNotFoundError(
+            f"Prompt file not found: {prompt_file}. Run run-gpt first to generate variant_prompt.txt."
+        )
+
+    effective_url = (
+        url
+        or designrun.get("variant_project_url")
+        or read_config().get("variant_start_url")
+        or "https://variant.com/projects"
+    )
+
+    out_dir = step_dir / "generators" / "variant"
+    ensure_step_layout(step_dir)
+
+    ref_images_dir = step_dir / "references" / "images"
+    image_args: List[str] = []
+    if ref_images_dir.exists():
+        candidates = sorted(ref_images_dir.iterdir())
+        for p in candidates:
+            if not p.is_file():
+                continue
+            if p.stat().st_size >= MAX_IMAGE_SIZE_BYTES:
+                continue
+            image_args.append(str(p))
+            if len(image_args) >= MAX_REFERENCE_IMAGES:
+                break
+
+    append_event(run_dir, "variant_started", {"step_id": step_id})
+
+    script = get_variant_operator_script()
+    cmd = [
+        sys.executable,
+        str(script),
+        "run",
+        "--url", effective_url,
+        "--prompt-file", str(prompt_file),
+        "--out", str(out_dir),
+        "--timeout-s", str(timeout_s),
+    ]
+    for img in image_args:
+        cmd.extend(["--image", img])
+    if headed:
+        cmd.append("--headed")
+    if profile_dir:
+        cmd.append("--profile-dir")
+        cmd.append(profile_dir)
+    if connect:
+        cmd.append("--connect")
+        cmd.append(connect)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s + 60,
+            cwd=str(script.parent),
+        )
+    except subprocess.TimeoutExpired as e:
+        append_event(run_dir, "variant_finished", {"step_id": step_id, "success": False, "error": "timeout"})
+        raise RuntimeError("variant_operator timed out") from e
+
+    if result.returncode != 0:
+        append_event(run_dir, "variant_finished", {
+            "step_id": step_id,
+            "success": False,
+            "error": (result.stderr or result.stdout or "non-zero exit")[:500],
+        })
+        raise RuntimeError(f"variant_operator failed: {result.stderr or result.stdout}")
+
+    variant_project_url = None
+    try:
+        out = (result.stdout or "").strip()
+        if out:
+            parsed = json.loads(out)
+            variant_project_url = parsed.get("variant_project_url")
+    except Exception:
+        pass
+    if variant_project_url:
+        update_designrun(run_dir, {"variant_project_url": variant_project_url})
+
+    append_event(run_dir, "variant_finished", {"step_id": step_id, "success": True})
+    return {"ok": True, "step_id": step_id, "variant_dir": str(out_dir), "variant_project_url": variant_project_url}
+
+
+def run_variant_export_only(
+    run_id: str,
+    step_id: str,
+    *,
+    url: Optional[str] = None,
+    headed: bool = False,
+    profile_dir: Optional[str] = None,
+    connect: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Reload the variant project at its step and export all existing outputs (links, screenshots, HTML)
+    without triggering a new generation. Uses project URL from --url, step's generators/variant/url.txt,
+    or designrun.json variant_project_url.
+    """
+    run_dir = get_run_dir(run_id)
+    step_dir = get_step_dir(run_id, step_id)
+    designrun = read_designrun(run_dir)
+
+    url_txt = step_dir / "generators" / "variant" / "url.txt"
+    effective_url = url or (url_txt.read_text(encoding="utf-8").strip() if url_txt.exists() else None) or designrun.get("variant_project_url")
+    if not effective_url:
+        raise ValueError(
+            "No Variant project URL. Run run-variant first for this step, or pass --url with the project URL (variant.com/chat/...)."
+        )
+
+    out_dir = step_dir / "generators" / "variant"
+    ensure_step_layout(step_dir)
+
+    append_event(run_dir, "variant_export_only_started", {"step_id": step_id})
+
+    script = get_variant_operator_script()
+    cmd = [
+        sys.executable,
+        str(script),
+        "export-only",
+        "--url", effective_url,
+        "--out", str(out_dir),
+    ]
+    if headed:
+        cmd.append("--headed")
+    if profile_dir:
+        cmd.append("--profile-dir")
+        cmd.append(profile_dir)
+    if connect:
+        cmd.append("--connect")
+        cmd.append(connect)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(script.parent),
+        )
+    except subprocess.TimeoutExpired as e:
+        append_event(run_dir, "variant_export_only_finished", {"step_id": step_id, "success": False, "error": "timeout"})
+        raise RuntimeError("variant_operator export-only timed out") from e
+
+    if result.returncode != 0:
+        append_event(run_dir, "variant_export_only_finished", {
+            "step_id": step_id,
+            "success": False,
+            "error": (result.stderr or result.stdout or "non-zero exit")[:500],
+        })
+        raise RuntimeError(f"variant_operator export-only failed: {result.stderr or result.stdout}")
+
+    append_event(run_dir, "variant_export_only_finished", {"step_id": step_id, "success": True})
+    try:
+        out = (result.stdout or "").strip()
+        if out:
+            return json.loads(out)
+    except Exception:
+        pass
+    return {"ok": True, "step_id": step_id, "variant_dir": str(out_dir), "export_only": True}
+
+
+# ----------------------------
 # CLI
 # ----------------------------
 
@@ -608,6 +812,25 @@ def build_parser() -> argparse.ArgumentParser:
     aura_p.add_argument("--headed", action="store_true", help="Run browser visible.")
     aura_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
     aura_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
+
+    # run-variant
+    variant_p = sub.add_parser("run-variant", help="Run variant_operator for step (VARIATIONS mode only).")
+    variant_p.add_argument("run_id", help="Run identifier.")
+    variant_p.add_argument("step_id", help="Step id.")
+    variant_p.add_argument("--url", default=None, help="Start or project URL (else from designrun.json or config variant_start_url).")
+    variant_p.add_argument("--timeout-s", type=int, default=300, help="Timeout for 4 new outputs.")
+    variant_p.add_argument("--headed", action="store_true", help="Run browser visible.")
+    variant_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
+    variant_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
+
+    # export-variant
+    export_variant_p = sub.add_parser("export-variant", help="Reload variant project at step and export all outputs (no new generation).")
+    export_variant_p.add_argument("run_id", help="Run identifier.")
+    export_variant_p.add_argument("step_id", help="Step id.")
+    export_variant_p.add_argument("--url", default=None, help="Project URL (else from step generators/variant/url.txt or designrun.json).")
+    export_variant_p.add_argument("--headed", action="store_true", help="Run browser visible.")
+    export_variant_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
+    export_variant_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
 
     return p
 
@@ -674,6 +897,39 @@ def main() -> int:
                 ns.step_id,
                 url=ns.url,
                 timeout_s=ns.timeout_s,
+                headed=ns.headed,
+                profile_dir=ns.profile_dir,
+                connect=ns.connect,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+
+    if ns.cmd == "run-variant":
+        try:
+            result = run_variant(
+                ns.run_id,
+                ns.step_id,
+                url=ns.url,
+                timeout_s=ns.timeout_s,
+                headed=ns.headed,
+                profile_dir=ns.profile_dir,
+                connect=ns.connect,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        except (ValueError, FileNotFoundError, RuntimeError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+
+    if ns.cmd == "export-variant":
+        try:
+            result = run_variant_export_only(
+                ns.run_id,
+                ns.step_id,
+                url=ns.url,
                 headed=ns.headed,
                 profile_dir=ns.profile_dir,
                 connect=ns.connect,

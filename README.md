@@ -1,6 +1,6 @@
 # Design automation
 
-UI design automation that coordinates ChatGPT (gpt_operator) and Aura.build (aura_operator); Variant.ai is planned. The **designrun-manager** is the main entry point: it owns run/step layout and state, and invokes platform scripts.
+UI design automation that coordinates ChatGPT (gpt_operator), Aura.build (aura_operator), and Variant (variant_operator). The **designrun-manager** is the main entry point: it owns run/step layout and state, and invokes platform scripts.
 
 ## Quick test: commands in order
 
@@ -76,7 +76,33 @@ python designrun_manager.py run-gpt my-run S01_dna_01 --url "https://chatgpt.com
 
 After a successful run, the manager writes `runs/<run_id>/<step_id>/gpt/response.json` and `gpt/outputs/aura_dna.txt` (or variant_prompt.txt / aura_edit.txt depending on mode), and updates `designrun.json` with `chat_url` for the next run.
 
-### 5. Run Aura (DNA or FEEDBACK)
+### 5. Run Variant (VARIATIONS)
+
+Variant uses the step **mode** `VARIATIONS` and the prompt from `gpt/outputs/variant_prompt.txt`. Run `run-gpt` first so that file exists.
+
+- **First run**: Start URL is `--url`, or **config.json** `variant_start_url`, or default `https://variant.com/projects`. After submit, the operator waits for a project URL (e.g. `variant.com/chat/...` or `variant.com/projects/...`), saves it to `designrun.json` (`variant_project_url`) and `generators/variant/url.txt`.
+- **Later runs**: Uses `variant_project_url` from `designrun.json` (or `--url`) so the same project gets 4 new outputs per run.
+
+The operator waits for 4 new output cards (cards with a Menu button and a new label), then for each: hover card → Menu → Copy code (saves HTML under `generators/variant/exports/`), Menu → Open in new tab (saves URL to `generators/variant/urls.json`, screenshot to `generators/variant/captures/`, then closes the tab).
+
+```powershell
+python designrun_manager.py run-variant my-run S01_dna_01 --headed
+```
+
+**With persistent login or CDP**:
+
+```powershell
+python designrun_manager.py run-variant my-run S01_dna_01 --headed --profile-dir profiles/variant
+python designrun_manager.py run-variant my-run S01_dna_01 --connect "http://127.0.0.1:9222"
+```
+
+**Export only (no new generation):** To reload the project at a step and re-export all existing outputs (links, screenshots, HTML) without submitting a new prompt, use `export-variant`. The project URL is taken from the step’s `generators/variant/url.txt` or `designrun.json` (`variant_project_url`), or pass `--url`.
+
+```powershell
+python designrun_manager.py export-variant my-run S03_variation_01 --headed
+```
+
+### 6. Run Aura (DNA or FEEDBACK)
 
 Aura uses the step **mode** from `input/mode.txt`: **DNA** (new project from `aura_dna.txt`) or **FEEDBACK** (edit existing project with `aura_edit.txt`). Ensure `run-gpt` has already produced the right file: `gpt/outputs/aura_dna.txt` for DNA, `gpt/outputs/aura_edit.txt` for FEEDBACK.
 
@@ -107,13 +133,14 @@ python designrun_manager.py run-aura my-run S01_dna_01 --connect "http://127.0.0
 
 Aura operator: detects Sign in; submits prompt + images; waits for “Generating code...” to disappear; Export → Copy HTML (saved under `generators/aura/exports/`); Hide sidebar → full-page screenshot → `generators/aura/captures/`; Show sidebar.
 
-### 6. Inspect outputs
+### 7. Inspect outputs
 
-- Run state: `runs\my-run\designrun.json` (`chat_url`, `aura_project_url`)
+- Run state: `runs\my-run\designrun.json` (`chat_url`, `aura_project_url`, `variant_project_url`)
 - Event log: `runs\my-run\events.ndjson`
 - Step input: `runs\my-run\steps\S01_dna_01\input\user_text.txt`, `mode.txt`
 - GPT raw + normalized: `runs\my-run\steps\S01_dna_01\gpt\response.json`, `gpt\outputs\aura_dna.txt` (etc.)
 - Aura: `steps\S01_dna_01\generators\aura\prompt_used.txt`, `url.txt`, `exports\*.html`, `captures\*.png`
+- Variant: `steps\<step_id>\generators\variant\prompt_used.txt`, `url.txt`, `urls.json`, `exports\*.html`, `captures\*.png`
 
 ---
 
@@ -127,6 +154,8 @@ Aura operator: detects Sign in; submits prompt + images; waits for “Generating
 | 4 (optional) | `python designrun_manager.py add-references <run_id> <step_id> <image> [<image> ...] [--map <json or path>]` | Copy refs and write map.json |
 | 5 | `python designrun_manager.py run-gpt <run_id> <step_id> [--url <chatgpt url>] [--headed] [--connect <cdp url>] [--profile-dir <path>] [--timeout-s 180]` | Run ChatGPT step; URL from --url, or designrun.json, or config.json `chatgpt_url` |
 | 6 (optional) | `python designrun_manager.py run-aura <run_id> <step_id> [--url <start or project url>] [--headed] [--connect <cdp url>] [--profile-dir <path>] [--timeout-s 150]` | Run Aura step (DNA or FEEDBACK from mode.txt); DNA needs aura_dna.txt, FEEDBACK needs aura_edit.txt + aura_project_url |
+| 6 (optional) | `python designrun_manager.py run-variant <run_id> <step_id> [--url <start or project url>] [--headed] [--connect <cdp url>] [--profile-dir <path>] [--timeout-s 300]` | Run Variant step (VARIATIONS only); needs variant_prompt.txt; updates variant_project_url |
+| 6 (optional) | `python designrun_manager.py export-variant <run_id> <step_id> [--url <project url>] [--headed] [--connect <cdp url>] [--profile-dir <path>]` | Reload variant project at step and export all outputs (links, screenshots, HTML); no new generation |
 
 ---
 
@@ -135,10 +164,12 @@ Aura operator: detects Sign in; submits prompt + images; waits for “Generating
 - **config.json** (project root):
   - `chatgpt_url` – Default ChatGPT URL so `run-gpt` can run without `--url`.
   - `aura_start_url` – (Optional) Aura DNA start URL; default is `https://www.aura.build/`.
+  - `variant_start_url` – (Optional) Variant start URL; default is `https://variant.com/projects`.
 - **DESIGN_RUNS_DIR** – Root directory for runs (default: `runs`). Runs are stored under `<DESIGN_RUNS_DIR>/<run_id>/`.
 
 ## Scripts
 
-- **designrun_manager.py** – Main controller: run/step layout, events, invokes gpt_operator and aura_operator (Variant planned).
+- **designrun_manager.py** – Main controller: run/step layout, events, invokes gpt_operator, aura_operator, and variant_operator.
 - **gpt_operator.py** – ChatGPT automation: send prompt (and images) to a gizmo/chat, wait for response, write raw + extracted blocks.
 - **aura_operator.py** – Aura.build automation: DNA (new project from aura_dna.txt) and FEEDBACK (edit with aura_edit.txt); auth, submit, wait for “Generating code...” to finish, Export → Copy HTML, full-page screenshot.
+- **variant_operator.py** – Variant automation: `run` (VARIATIONS: submit variant_prompt.txt, wait for 4 new outputs, export each); `export-only` (reload project URL, export all existing outputs without generating).
