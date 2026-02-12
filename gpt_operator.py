@@ -319,6 +319,18 @@ class RunArgs:
     connect_url: Optional[str]
     timeout_s: int
 
+
+@dataclass
+class ReexportArgs:
+    """Args for re-export: open existing chat URL and re-capture last assistant output (no new prompt)."""
+    url: str
+    out_dir: Path
+    headed: bool
+    profile_dir: Optional[Path]
+    connect_url: Optional[str]
+    settle_timeout_s: int  # max wait for page to settle before copy
+
+
 def run_gpt_operator(args: RunArgs) -> Dict[str, Any]:
     ensure_dir(args.out_dir)
     meta = {
@@ -355,6 +367,10 @@ def run_gpt_operator(args: RunArgs) -> Dict[str, Any]:
                     "No browser context found. Make sure Chrome was started with --remote-debugging-port=9222"
                 )
             context = browser.contexts[0]
+            try:
+                context.grant_permissions(["clipboard-read", "clipboard-write"])
+            except Exception:
+                pass
             pages = context.pages
             page = None
             for tab in pages:
@@ -386,6 +402,11 @@ def run_gpt_operator(args: RunArgs) -> Dict[str, Any]:
                 )
             else:
                 context = browser.new_context()
+            if not attached:
+                try:
+                    context.grant_permissions(["clipboard-read", "clipboard-write"])
+                except Exception:
+                    pass
             page = context.new_page()
             page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(1500)
@@ -559,9 +580,204 @@ def run_gpt_operator(args: RunArgs) -> Dict[str, Any]:
                     pass
 
 
+def run_gpt_reexport(args: ReexportArgs) -> Dict[str, Any]:
+    """
+    Re-export only: navigate to an existing ChatGPT conversation URL (e.g. from designrun.json),
+    then re-capture the last assistant message to raw.txt, blocks.json, extracted.json. No prompt submit.
+    """
+    ensure_dir(args.out_dir)
+    meta: Dict[str, Any] = {
+        "mode": "REEXPORT",
+        "url": args.url,
+        "out_dir": str(args.out_dir),
+        "started_ms": now_ms(),
+    }
+
+    raw_path = args.out_dir / "raw.txt"
+    result_path = args.out_dir / "result.json"
+    blocks_path = args.out_dir / "blocks.json"
+    extracted_path = args.out_dir / "extracted.json"
+    debug_html = args.out_dir / "debug.html"
+    debug_png = args.out_dir / "debug.png"
+
+    def save_debug(page: Page) -> None:
+        try:
+            debug_html.write_text(page.content(), encoding="utf-8")
+            page.screenshot(path=str(debug_png), full_page=True)
+        except Exception:
+            pass
+
+    with sync_playwright() as p:
+        attached = args.connect_url is not None
+        if attached:
+            connect_url = args.connect_url.strip()
+            if "localhost" in connect_url:
+                connect_url = connect_url.replace("localhost", "127.0.0.1")
+            try:
+                browser = p.chromium.connect_over_cdp(connect_url)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not connect to browser at {connect_url}: {e}. "
+                    "Start Chrome with: chrome.exe --remote-debugging-port=9222 "
+                    "then run this script again with --connect http://127.0.0.1:9222"
+                ) from e
+            if not browser.contexts:
+                raise RuntimeError(
+                    "No browser context found. Make sure Chrome was started with --remote-debugging-port=9222"
+                )
+            context = browser.contexts[0]
+            try:
+                context.grant_permissions(["clipboard-read", "clipboard-write"])
+            except Exception:
+                pass
+            pages = context.pages
+            page = None
+            for tab in pages:
+                try:
+                    u = tab.url or ""
+                    if args.url.rstrip("/") in u or (u.startswith("https://chatgpt.com") and "/g/" in u):
+                        page = tab
+                        if args.url.rstrip("/") in u:
+                            break
+                except Exception:
+                    pass
+            if page is None and pages:
+                page = pages[0]
+            if page is None:
+                raise RuntimeError(
+                    "No tabs found in the attached browser. Open a ChatGPT tab (or the chat URL) and re-run with --connect."
+                )
+            if args.url.rstrip("/") not in (page.url or ""):
+                page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(1500)
+        else:
+            browser = p.chromium.launch(headless=not args.headed)
+            if args.profile_dir is not None:
+                ensure_dir(args.profile_dir)
+                browser.close()
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=str(args.profile_dir),
+                    headless=not args.headed,
+                )
+            else:
+                context = browser.new_context()
+            if not attached:
+                try:
+                    context.grant_permissions(["clipboard-read", "clipboard-write"])
+                except Exception:
+                    pass
+            page = context.new_page()
+            page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(1500)
+
+        try:
+            if page_has_auth_gate(page):
+                save_debug(page)
+                if attached:
+                    raise RuntimeError(
+                        "Auth required in the attached tab (Log in/Sign up detected). "
+                        "Log in in that browser tab and re-run with --connect."
+                    )
+                raise RuntimeError(
+                    "Auth required (Log in/Sign up detected). "
+                    "Run with --profile-dir and --headed, or use --connect with an already-logged-in Chrome."
+                )
+
+            settle_ms = (min(args.settle_timeout_s, 10) * 1000) if args.settle_timeout_s > 0 else 3000
+            page.wait_for_timeout(settle_ms)
+
+            copied = click_copy_last_assistant(page)
+            meta["copied_via_clipboard"] = bool(copied)
+
+            if not copied:
+                candidates = [
+                    page.locator("[data-message-author-role='assistant']").last,
+                    page.locator("article").last,
+                    page.locator("[role='article']").last,
+                ]
+                for c in candidates:
+                    try:
+                        if c.count() > 0:
+                            txt = c.inner_text(timeout=2000)
+                            if txt and txt.strip():
+                                copied = txt
+                                break
+                    except Exception:
+                        pass
+
+            if not copied:
+                save_debug(page)
+                raise RuntimeError("Re-export: could not copy or read assistant output from the page.")
+
+            raw_path.write_text(copied, encoding="utf-8")
+
+            blocks = extract_code_blocks(copied)
+            dump_json(blocks_path, blocks)
+
+            extracted: Dict[str, Any] = {}
+            parsed = parse_raw_to_json(copied)
+            if parsed is not None:
+                extracted = extract_prompt_blocks(parsed)
+            from_blocks = extract_prompt_blocks_from_code_blocks(blocks)
+            for k, v in from_blocks.items():
+                if v is not None:
+                    extracted[k] = v
+            dump_json(extracted_path, extracted)
+
+            try:
+                chat_url = (page.url or "").strip() or None
+            except Exception:
+                chat_url = None
+            meta["chat_url"] = chat_url
+
+            meta["finished_ms"] = now_ms()
+            meta["raw_path"] = str(raw_path)
+            meta["blocks_path"] = str(blocks_path)
+            meta["extracted_path"] = str(extracted_path)
+            dump_json(result_path, meta)
+
+            return {
+                "ok": True,
+                "raw_path": str(raw_path),
+                "blocks_path": str(blocks_path),
+                "extracted_path": str(extracted_path),
+                "meta_path": str(result_path),
+                "blocks_count": len(blocks),
+                "extracted_keys": list(extracted.keys()),
+                "chat_url": chat_url,
+            }
+
+        except Exception as e:
+            meta["error"] = str(e)
+            meta["finished_ms"] = now_ms()
+            try:
+                dump_json(result_path, meta)
+            except Exception:
+                pass
+            raise
+        finally:
+            if not attached:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+
 # ----------------------------
 # CLI
 # ----------------------------
+
+def load_chat_url_from_designrun(designrun_path: Path) -> str:
+    """Read chat_url from designrun.json. Raises if missing or invalid."""
+    data = json.loads(designrun_path.read_text(encoding="utf-8"))
+    url = (data.get("chat_url") or "").strip()
+    if not url:
+        raise ValueError(
+            f"No 'chat_url' in {designrun_path}. "
+            "Run a GPT step first so the conversation URL is saved, or use --url explicitly."
+        )
+    return url
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gpt_operator", description="Local runner for ChatGPT gizmo automation.")
@@ -581,6 +797,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="URL",
         help="Attach to existing Chrome via CDP (e.g. http://localhost:9222). Use the tab you have open and logged in.",
+    )
+
+    reexport = sub.add_parser(
+        "re-export",
+        help="Re-export only: open existing chat URL and re-capture last assistant output (no new prompt).",
+    )
+    reexport.add_argument(
+        "--designrun",
+        metavar="PATH",
+        help="Path to designrun.json; chat_url is read from here.",
+    )
+    reexport.add_argument(
+        "--url",
+        help="ChatGPT conversation URL (e.g. https://chatgpt.com/g/.../c/...). Use if not using --designrun.",
+    )
+    reexport.add_argument("--out", required=True, help="Output directory (e.g. steps/<step>/gpt).")
+    reexport.add_argument(
+        "--settle-timeout-s",
+        type=int,
+        default=3,
+        help="Seconds to wait for page to settle before copying (default 3).",
+    )
+    reexport.add_argument("--headed", action="store_true", help="Run with visible browser window.")
+    reexport.add_argument("--profile-dir", default=None, help="Chrome profile dir for persistent login session.")
+    reexport.add_argument(
+        "--connect",
+        default=None,
+        metavar="URL",
+        help="Attach to existing Chrome via CDP.",
     )
     return p
 
@@ -612,6 +857,32 @@ def main():
 
         result = run_gpt_operator(rargs)
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if ns.cmd == "re-export":
+        out_dir = Path(ns.out).resolve()
+        profile_dir = Path(ns.profile_dir).resolve() if ns.profile_dir else None
+        connect_url = (ns.connect or "").strip() or None
+        if getattr(ns, "designrun", None):
+            url = load_chat_url_from_designrun(Path(ns.designrun).resolve())
+        elif (getattr(ns, "url", None) or "").strip():
+            url = (ns.url or "").strip()
+        else:
+            parser.error("re-export: provide --designrun PATH or --url URL.")
+        rargs = ReexportArgs(
+            url=url,
+            out_dir=out_dir,
+            headed=bool(ns.headed),
+            profile_dir=profile_dir,
+            connect_url=connect_url,
+            settle_timeout_s=int(getattr(ns, "settle_timeout_s", 3)),
+        )
+        result = run_gpt_reexport(rargs)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    parser.error(f"Unknown command: {ns.cmd}")
+
 
 if __name__ == "__main__":
     main()

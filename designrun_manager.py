@@ -139,7 +139,6 @@ def ensure_step_layout(step_dir: Path) -> None:
     (step_dir / "generators" / "aura" / "exports").mkdir(parents=True, exist_ok=True)
     (step_dir / "generators" / "aura" / "captures").mkdir(parents=True, exist_ok=True)
     (step_dir / "generators" / "variant").mkdir(parents=True, exist_ok=True)
-    (step_dir / "generators" / "variant" / "exports").mkdir(parents=True, exist_ok=True)
     (step_dir / "generators" / "variant" / "captures").mkdir(parents=True, exist_ok=True)
 
 
@@ -675,42 +674,30 @@ def run_variant(
     return {"ok": True, "step_id": step_id, "variant_dir": str(out_dir), "variant_project_url": variant_project_url}
 
 
-def run_variant_export_only(
+def run_variant_re_export(
     run_id: str,
     step_id: str,
     *,
-    url: Optional[str] = None,
     headed: bool = False,
     profile_dir: Optional[str] = None,
     connect: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Reload the variant project at its step and export all existing outputs (links, screenshots, HTML)
-    without triggering a new generation. Uses project URL from --url, step's generators/variant/url.txt,
-    or designrun.json variant_project_url.
+    Re-export variant outputs from result.json: read version_ids, visit each variant.com/shared/<id>,
+    take screenshots, write urls.json. Requires a prior run-variant so step has result.json with version_ids.
     """
     run_dir = get_run_dir(run_id)
     step_dir = get_step_dir(run_id, step_id)
-    designrun = read_designrun(run_dir)
-
-    url_txt = step_dir / "generators" / "variant" / "url.txt"
-    effective_url = url or (url_txt.read_text(encoding="utf-8").strip() if url_txt.exists() else None) or designrun.get("variant_project_url")
-    if not effective_url:
-        raise ValueError(
-            "No Variant project URL. Run run-variant first for this step, or pass --url with the project URL (variant.com/chat/...)."
-        )
-
     out_dir = step_dir / "generators" / "variant"
     ensure_step_layout(step_dir)
 
-    append_event(run_dir, "variant_export_only_started", {"step_id": step_id})
+    append_event(run_dir, "variant_re_export_started", {"step_id": step_id})
 
     script = get_variant_operator_script()
     cmd = [
         sys.executable,
         str(script),
-        "export-only",
-        "--url", effective_url,
+        "re-export",
         "--out", str(out_dir),
     ]
     if headed:
@@ -731,25 +718,25 @@ def run_variant_export_only(
             cwd=str(script.parent),
         )
     except subprocess.TimeoutExpired as e:
-        append_event(run_dir, "variant_export_only_finished", {"step_id": step_id, "success": False, "error": "timeout"})
-        raise RuntimeError("variant_operator export-only timed out") from e
+        append_event(run_dir, "variant_re_export_finished", {"step_id": step_id, "success": False, "error": "timeout"})
+        raise RuntimeError("variant_operator re-export timed out") from e
 
     if result.returncode != 0:
-        append_event(run_dir, "variant_export_only_finished", {
+        append_event(run_dir, "variant_re_export_finished", {
             "step_id": step_id,
             "success": False,
             "error": (result.stderr or result.stdout or "non-zero exit")[:500],
         })
-        raise RuntimeError(f"variant_operator export-only failed: {result.stderr or result.stdout}")
+        raise RuntimeError(f"variant_operator re-export failed: {result.stderr or result.stdout}")
 
-    append_event(run_dir, "variant_export_only_finished", {"step_id": step_id, "success": True})
+    append_event(run_dir, "variant_re_export_finished", {"step_id": step_id, "success": True})
     try:
         out = (result.stdout or "").strip()
         if out:
             return json.loads(out)
     except Exception:
         pass
-    return {"ok": True, "step_id": step_id, "variant_dir": str(out_dir), "export_only": True}
+    return {"ok": True, "step_id": step_id, "variant_dir": str(out_dir), "re_export": True}
 
 
 # ----------------------------
@@ -818,19 +805,18 @@ def build_parser() -> argparse.ArgumentParser:
     variant_p.add_argument("run_id", help="Run identifier.")
     variant_p.add_argument("step_id", help="Step id.")
     variant_p.add_argument("--url", default=None, help="Start or project URL (else from designrun.json or config variant_start_url).")
-    variant_p.add_argument("--timeout-s", type=int, default=300, help="Timeout for 4 new outputs.")
+    variant_p.add_argument("--timeout-s", type=int, default=300, help="Timeout for streaming API (generation complete).")
     variant_p.add_argument("--headed", action="store_true", help="Run browser visible.")
     variant_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
     variant_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
 
-    # export-variant
-    export_variant_p = sub.add_parser("export-variant", help="Reload variant project at step and export all outputs (no new generation).")
-    export_variant_p.add_argument("run_id", help="Run identifier.")
-    export_variant_p.add_argument("step_id", help="Step id.")
-    export_variant_p.add_argument("--url", default=None, help="Project URL (else from step generators/variant/url.txt or designrun.json).")
-    export_variant_p.add_argument("--headed", action="store_true", help="Run browser visible.")
-    export_variant_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
-    export_variant_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
+    # re-export-variant
+    reexport_variant_p = sub.add_parser("re-export-variant", help="Re-export from result.json: read version_ids, visit each shared URL, screenshot.")
+    reexport_variant_p.add_argument("run_id", help="Run identifier.")
+    reexport_variant_p.add_argument("step_id", help="Step id.")
+    reexport_variant_p.add_argument("--headed", action="store_true", help="Run browser visible.")
+    reexport_variant_p.add_argument("--profile-dir", default=None, help="Chrome profile for login.")
+    reexport_variant_p.add_argument("--connect", default=None, metavar="URL", help="Attach to Chrome via CDP.")
 
     return p
 
@@ -924,12 +910,11 @@ def main() -> int:
             print(str(e), file=sys.stderr)
             return 1
 
-    if ns.cmd == "export-variant":
+    if ns.cmd == "re-export-variant":
         try:
-            result = run_variant_export_only(
+            result = run_variant_re_export(
                 ns.run_id,
                 ns.step_id,
-                url=ns.url,
                 headed=ns.headed,
                 profile_dir=ns.profile_dir,
                 connect=ns.connect,
